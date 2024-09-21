@@ -1,31 +1,44 @@
-use std::fs;
-use std::path::PathBuf;
+use std::{
+    fs,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use toml;
 use tower_lsp::lsp_types::InitializeParams;
 
+#[derive(Debug, Default, Clone)]
+pub struct Config(pub Arc<Mutex<ConfigValues>>);
+
 #[derive(Debug, Default, Clone, Deserialize)]
-pub struct Config {
+pub struct ConfigValues {
     pub partials_dirs: Vec<PathBuf>,
+    pub workspace_root: Option<PathBuf>,
 }
 
 const CONFIG_FILE: &str = ".supermdx.toml";
 
-impl Config {
+impl ConfigValues {
     pub fn update(&mut self, params: &InitializeParams) -> Result<()> {
-        if let Some(root_uri) = &params.root_uri {
-            let workspace_root = root_uri.to_file_path().map_err(|_| {
-                anyhow::anyhow!("Failed to convert workspace root URI to file path")
-            })?;
+        self.workspace_root = params
+            .root_uri
+            .as_ref()
+            .ok_or_else(|| anyhow!("No root URI provided"))?
+            .to_file_path()
+            .map_err(|_| anyhow!("Invalid root URI: unable to convert to file path"))?
+            .into();
 
-            let config_path = workspace_root.join(CONFIG_FILE);
+        let workspace_root = self.workspace_root.as_ref().unwrap();
+        let config_path = workspace_root.join(CONFIG_FILE);
+
+        if config_path.exists() {
             let config_str = fs::read_to_string(&config_path).with_context(|| {
                 format!("Failed to read config file: {}", config_path.display())
             })?;
 
-            let config: Config = toml::from_str(&config_str).with_context(|| {
+            let config: ConfigValues = toml::from_str(&config_str).with_context(|| {
                 format!("Failed to parse config file: {}", config_path.display())
             })?;
 
@@ -34,8 +47,11 @@ impl Config {
                 .into_iter()
                 .map(|dir| workspace_root.join(dir))
                 .collect();
+
+            Ok(())
+        } else {
+            Err(anyhow!("Config file not found: {}", config_path.display()))
         }
-        Ok(())
     }
 }
 
@@ -68,11 +84,15 @@ partials_dirs = ["custom_partials"]
 "#,
         );
 
-        let mut config = Config::default();
-        config.update(&params).unwrap();
+        let mut config_values = ConfigValues::default();
+        config_values.update(&params).unwrap();
 
         let expected_path = root_dir.path().join("custom_partials");
-        assert_eq!(config.partials_dirs, vec![expected_path]);
+        assert_eq!(
+            config_values.workspace_root,
+            Some(root_dir.path().to_path_buf())
+        );
+        assert_eq!(config_values.partials_dirs, vec![expected_path]);
     }
 
     #[test]
@@ -85,14 +105,14 @@ partials_dirs = ["components/partials", "layouts"]
 "#,
         );
 
-        let mut config = Config::default();
-        config.update(&params).unwrap();
+        let mut config_values = ConfigValues::default();
+        config_values.update(&params).unwrap();
 
         let expected_paths = vec![
             root_dir.path().join("components").join("partials"),
             root_dir.path().join("layouts"),
         ];
-        assert_eq!(config.partials_dirs, expected_paths);
+        assert_eq!(config_values.partials_dirs, expected_paths);
     }
 
     #[test]
@@ -105,11 +125,11 @@ partials_dirs = ["components/partials", "layouts"]
 "#,
         );
 
-        let mut config = Config::default();
-        let result = config.update(&params);
+        let mut config_values = ConfigValues::default();
+        let result = config_values.update(&params);
 
         assert!(result.is_err());
-        assert!(config.partials_dirs.is_empty());
+        assert!(config_values.partials_dirs.is_empty());
     }
 
     #[test]
@@ -122,11 +142,11 @@ partials_dirs = 42  # Invalid type
 "#,
         );
 
-        let mut config = Config::default();
-        let result = config.update(&params);
+        let mut config_values = ConfigValues::default();
+        let result = config_values.update(&params);
 
         assert!(result.is_err());
-        assert!(config.partials_dirs.is_empty());
+        assert!(config_values.partials_dirs.is_empty());
     }
 
     #[test]
@@ -135,22 +155,23 @@ partials_dirs = 42  # Invalid type
         let mut params = InitializeParams::default();
         params.root_uri = Some(Url::from_file_path(root_dir.path()).unwrap());
 
-        let mut config = Config::default();
-        let result = config.update(&params);
+        let mut config_values = ConfigValues::default();
+        let result = config_values.update(&params);
 
         assert!(result.is_err());
-        assert!(config.partials_dirs.is_empty());
+        assert!(config_values.partials_dirs.is_empty());
     }
 
     #[test]
     fn test_update_without_root_uri() {
         let params = InitializeParams::default();
 
-        let mut config = Config::default();
-        let result = config.update(&params);
+        let mut config_values = ConfigValues::default();
+        let result = config_values.update(&params);
 
-        assert!(result.is_ok());
-        assert!(config.partials_dirs.is_empty());
+        assert!(result.is_err());
+        assert!(config_values.workspace_root.is_none());
+        assert!(config_values.partials_dirs.is_empty());
     }
 
     #[test]
@@ -158,10 +179,11 @@ partials_dirs = 42  # Invalid type
         let mut params = InitializeParams::default();
         params.root_uri = Some(Url::parse("invalid://url").unwrap());
 
-        let mut config = Config::default();
-        let result = config.update(&params);
+        let mut config_values = ConfigValues::default();
+        let result = config_values.update(&params);
 
         assert!(result.is_err());
-        assert!(config.partials_dirs.is_empty());
+        assert!(config_values.workspace_root.is_none());
+        assert!(config_values.partials_dirs.is_empty());
     }
 }

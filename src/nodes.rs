@@ -1,6 +1,8 @@
 use markdown::mdast::Node;
 use tower_lsp::lsp_types::Position;
 
+mod partials;
+
 const PARTIAL: &str = "$Partial";
 
 pub trait NodeExt {

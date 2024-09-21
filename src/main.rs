@@ -1,8 +1,6 @@
-use std::sync::{Arc, Mutex};
-
 use dashmap::DashMap;
 use markdown::{mdast::Node, to_mdast};
-use tower_lsp::{jsonrpc, lsp_types::*, Client, LanguageServer};
+use tower_lsp::{jsonrpc, lsp_types::*, Client, LanguageServer, LspService, Server};
 
 mod ast;
 mod config;
@@ -17,7 +15,7 @@ use crate::parser::get_parser_options;
 #[derive(Debug)]
 pub struct Backend {
     client: Client,
-    config: Arc<Mutex<Config>>,
+    config: Config,
     ast_map: DashMap<String, Node>,
 }
 
@@ -85,7 +83,17 @@ impl LanguageServer for Backend {
 
         let ast = self.ast_map.get(&uri.to_string()).unwrap();
         let ancestor_chain = get_ancestor_chain(&ast, &position);
-        let deepest_match = find_deepest_match(&ancestor_chain, |node| node.is_partial());
+
+        if let Some(Node::MdxJsxFlowElement(element)) =
+            find_deepest_match(&ancestor_chain, |node| node.is_partial())
+        {
+            let uri = self.config.find_matching_partial(element);
+
+            return Ok(
+                // We just want to go to the file, it doesn't matter where.
+                uri.map(|uri| GotoDefinitionResponse::Scalar(Location::new(uri, Range::default()))),
+            );
+        }
 
         Ok(None)
     }
@@ -109,19 +117,18 @@ impl Backend {
     }
 
     async fn initialize_config(&self, params: &InitializeParams) {
-        self.config.lock().unwrap().update(params);
+        let _ = self.config.0.lock().unwrap().update(params);
     }
 }
 
-fn main() {
-    println!("Hello, world!");
-}
-
-#[cfg(test)]
-use ctor::ctor;
-
-#[cfg(test)]
-#[ctor]
-fn init_test_logger() {
+#[tokio::main]
+async fn main() {
     env_logger::init();
+
+    let stdin = tokio::io::stdin();
+    let stdout = tokio::io::stdout();
+
+    let (service, socket) = LspService::build(|client| Backend::new(client)).finish();
+
+    Server::new(stdin, stdout, socket).serve(service).await;
 }
