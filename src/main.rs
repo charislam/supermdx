@@ -1,5 +1,9 @@
 use dashmap::DashMap;
 use markdown::{mdast::Node, to_mdast};
+use tokio::io::{self, AsyncBufReadExt, BufReader};
+use tokio_stream::StreamExt;
+use tokio_util::bytes::Bytes;
+use tokio_util::io::StreamReader;
 use tower_lsp::{jsonrpc, lsp_types::*, Client, LanguageServer, LspService, Server};
 
 mod ast;
@@ -121,6 +125,50 @@ impl Backend {
     }
 }
 
+#[cfg(debug_assertions)]
+#[tokio::main]
+async fn main() {
+    env_logger::init();
+
+    let (stdin_tx, stdin_rx) = tokio::sync::mpsc::channel(100);
+
+    tokio::spawn(async move {
+        let stdin = io::stdin();
+        let mut reader = BufReader::new(stdin);
+        let mut line = String::new();
+
+        loop {
+            match reader.read_line(&mut line).await {
+                Ok(0) => {
+                    println!("Stdin closed, but keeping server alive.");
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
+                Ok(_) => {
+                    println!("Received: {:?}", line.trim());
+                    if let Err(e) = stdin_tx.send(line.clone()).await {
+                        eprintln!("Failed to send line to channel: {}", e);
+                    }
+                    line.clear(); // Clear the line for the next read
+                }
+                Err(e) => {
+                    eprintln!("Error reading from stdin: {}", e);
+                }
+            }
+        }
+    });
+
+    let stdin = StreamReader::new(
+        tokio_stream::wrappers::ReceiverStream::new(stdin_rx)
+            .map(|line| Ok::<_, io::Error>(Bytes::from(line))),
+    );
+    let stdout = io::stdout();
+
+    let (service, socket) = LspService::new(|client| Backend::new(client));
+    Server::new(stdin, stdout, socket).serve(service).await;
+}
+
+#[cfg(not(debug_assertions))]
 #[tokio::main]
 async fn main() {
     env_logger::init();
@@ -128,7 +176,6 @@ async fn main() {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
-    let (service, socket) = LspService::build(|client| Backend::new(client)).finish();
-
+    let (service, socket) = LspService::new(|client| Backend::new(client));
     Server::new(stdin, stdout, socket).serve(service).await;
 }
