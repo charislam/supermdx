@@ -1,24 +1,31 @@
-use ast::{find_deepest_match, get_ancestor_chain};
+use std::sync::{Arc, Mutex};
+
 use dashmap::DashMap;
 use markdown::{mdast::Node, to_mdast};
-use parser::get_parser_options;
 use tower_lsp::{jsonrpc, lsp_types::*, Client, LanguageServer};
 
 mod ast;
+mod config;
 mod nodes;
 mod parser;
 
+use crate::ast::{find_deepest_match, get_ancestor_chain};
+use crate::config::Config;
 use crate::nodes::NodeExt;
+use crate::parser::get_parser_options;
 
 #[derive(Debug)]
 pub struct Backend {
     client: Client,
+    config: Arc<Mutex<Config>>,
     ast_map: DashMap<String, Node>,
 }
 
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
-    async fn initialize(&self, _: InitializeParams) -> jsonrpc::Result<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> jsonrpc::Result<InitializeResult> {
+        self.initialize_config(&params).await;
+
         Ok(InitializeResult {
             server_info: None,
             capabilities: ServerCapabilities {
@@ -89,6 +96,7 @@ impl Backend {
         Self {
             client,
             ast_map: DashMap::new(),
+            config: Default::default(),
         }
     }
 
@@ -98,6 +106,10 @@ impl Backend {
             let ast = ast.unwrap();
             self.ast_map.insert(uri.to_string(), ast);
         }
+    }
+
+    async fn initialize_config(&self, params: &InitializeParams) {
+        self.config.lock().unwrap().update(params);
     }
 }
 
