@@ -1,60 +1,75 @@
+use std::fs;
 use std::path::PathBuf;
 
-use serde_json::Value;
+use anyhow::{Context, Result};
+use serde::Deserialize;
+use toml;
 use tower_lsp::lsp_types::InitializeParams;
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub struct Config {
     pub partials_dirs: Vec<PathBuf>,
 }
 
-impl Config {
-    pub fn update(&mut self, params: &InitializeParams) {
-        if let Some(partials_dir) = params
-            .initialization_options
-            .as_ref()
-            .and_then(|o| o.get("partials_dir"))
-        {
-            let dirs = match partials_dir {
-                Value::String(s) => vec![PathBuf::from(s)],
-                Value::Array(a) => a
-                    .iter()
-                    .filter_map(|v| v.as_str().map(|s| PathBuf::from(s)))
-                    .collect(),
-                _ => vec![],
-            };
+const CONFIG_FILE: &str = ".supermdx.toml";
 
-            if let Some(root_path) = params.root_uri.as_ref().and_then(|p| p.to_file_path().ok()) {
-                self.partials_dirs = dirs.into_iter().map(|dir| root_path.join(dir)).collect();
-            }
+impl Config {
+    pub fn update(&mut self, params: &InitializeParams) -> Result<()> {
+        if let Some(root_uri) = &params.root_uri {
+            let workspace_root = root_uri.to_file_path().map_err(|_| {
+                anyhow::anyhow!("Failed to convert workspace root URI to file path")
+            })?;
+
+            let config_path = workspace_root.join(CONFIG_FILE);
+            let config_str = fs::read_to_string(&config_path).with_context(|| {
+                format!("Failed to read config file: {}", config_path.display())
+            })?;
+
+            let config: Config = toml::from_str(&config_str).with_context(|| {
+                format!("Failed to parse config file: {}", config_path.display())
+            })?;
+
+            self.partials_dirs = config
+                .partials_dirs
+                .into_iter()
+                .map(|dir| workspace_root.join(dir))
+                .collect();
         }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use std::io::Write;
+
     use tempfile::TempDir;
-    use tower_lsp::lsp_types::{InitializeParams, Url};
+    use tower_lsp::lsp_types::Url;
 
     use super::*;
 
-    fn create_params(root_dir: &TempDir, partials_dir: Value) -> InitializeParams {
+    fn setup_config_params(root_dir: &TempDir, content: &str) -> InitializeParams {
+        let config_path = root_dir.path().join(CONFIG_FILE);
+        let mut file = fs::File::create(&config_path).unwrap();
+        file.write_all(content.as_bytes()).unwrap();
+
         let mut params = InitializeParams::default();
         params.root_uri = Some(Url::from_file_path(root_dir.path()).unwrap());
-        params.initialization_options = Some(json!({
-            "partials_dir": partials_dir
-        }));
         params
     }
 
     #[test]
     fn test_update_with_single_partials_dir() {
         let root_dir = TempDir::new().unwrap();
-        let params = create_params(&root_dir, json!("custom_partials"));
+        let params = setup_config_params(
+            &root_dir,
+            r#"
+partials_dirs = ["custom_partials"]
+"#,
+        );
 
         let mut config = Config::default();
-        config.update(&params);
+        config.update(&params).unwrap();
 
         let expected_path = root_dir.path().join("custom_partials");
         assert_eq!(config.partials_dirs, vec![expected_path]);
@@ -63,10 +78,15 @@ mod tests {
     #[test]
     fn test_update_with_multiple_partials_dirs() {
         let root_dir = TempDir::new().unwrap();
-        let params = create_params(&root_dir, json!(["components/partials", "layouts"]));
+        let params = setup_config_params(
+            &root_dir,
+            r#"
+partials_dirs = ["components/partials", "layouts"]
+"#,
+        );
 
         let mut config = Config::default();
-        config.update(&params);
+        config.update(&params).unwrap();
 
         let expected_paths = vec![
             root_dir.path().join("components").join("partials"),
@@ -78,12 +98,58 @@ mod tests {
     #[test]
     fn test_update_without_partials_dir() {
         let root_dir = TempDir::new().unwrap();
+        let params = setup_config_params(
+            &root_dir,
+            r#"
+# Empty config
+"#,
+        );
+
+        let mut config = Config::default();
+        let result = config.update(&params);
+
+        assert!(result.is_err());
+        assert!(config.partials_dirs.is_empty());
+    }
+
+    #[test]
+    fn test_update_with_invalid_config() {
+        let root_dir = TempDir::new().unwrap();
+        let params = setup_config_params(
+            &root_dir,
+            r#"
+partials_dirs = 42  # Invalid type
+"#,
+        );
+
+        let mut config = Config::default();
+        let result = config.update(&params);
+
+        assert!(result.is_err());
+        assert!(config.partials_dirs.is_empty());
+    }
+
+    #[test]
+    fn test_update_with_nonexistent_file() {
+        let root_dir = TempDir::new().unwrap();
         let mut params = InitializeParams::default();
         params.root_uri = Some(Url::from_file_path(root_dir.path()).unwrap());
 
         let mut config = Config::default();
-        config.update(&params);
+        let result = config.update(&params);
 
+        assert!(result.is_err());
+        assert!(config.partials_dirs.is_empty());
+    }
+
+    #[test]
+    fn test_update_without_root_uri() {
+        let params = InitializeParams::default();
+
+        let mut config = Config::default();
+        let result = config.update(&params);
+
+        assert!(result.is_ok());
         assert!(config.partials_dirs.is_empty());
     }
 
@@ -91,24 +157,11 @@ mod tests {
     fn test_update_with_invalid_root_uri() {
         let mut params = InitializeParams::default();
         params.root_uri = Some(Url::parse("invalid://url").unwrap());
-        params.initialization_options = Some(json!({
-            "partials_dir": "custom_partials"
-        }));
 
         let mut config = Config::default();
-        config.update(&params);
+        let result = config.update(&params);
 
-        assert!(config.partials_dirs.is_empty());
-    }
-
-    #[test]
-    fn test_update_with_non_string_partials_dir() {
-        let root_dir = TempDir::new().unwrap();
-        let params = create_params(&root_dir, json!(42));
-
-        let mut config = Config::default();
-        config.update(&params);
-
+        assert!(result.is_err());
         assert!(config.partials_dirs.is_empty());
     }
 }
